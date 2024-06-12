@@ -182,8 +182,8 @@ class DQR:
         dataContentDf["column_name2"] = dataContentDf.apply(lambda row : str(row["column_name"])  )
 
         payload = json.dumps({
-        "From": "gokhan@wearesilverbullet.com",
-        "To": "gokhan@wearesilverbullet.com",
+        "From": "gokhan@gmal.com",
+        "To": "gokhan@gmal.com.com",
         "Subject": "Hello from Postmark",
         "HtmlBody": dataContentDf.to_html(),
         "MessageStream": "notofications"
