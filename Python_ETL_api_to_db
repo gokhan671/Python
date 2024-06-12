@@ -1,0 +1,739 @@
+from cgi import print_exception
+import json
+from pickle import NONE
+import sys
+import time
+from types import TracebackType
+from urllib.request import Request
+from pyparsing import Dict
+import requests
+import logging
+import backoff
+import pandas as pd 
+import pytd
+from datetime import  datetime, timedelta
+import os
+import gc
+from gender import GenderDetector
+import phonenumbers
+from phonenumbers import carrier, geocoder
+import re
+from requests.adapters import HTTPAdapter, Retry 
+from requests import session 
+import pycountry
+import numpy 
+ 
+ 
+session = requests.Session()
+
+
+#global variables
+TdConnectionEndPoint = 'https://api.eu01.treasuredata.com/'
+
+autToken ='xxxxx' # prod
+databaseParam ="db_mews"
+writeApiUrl = f'https://api.eu01.treasuredata.com/event{databaseParam}'
+
+tdClientConnection = pytd.Client(database=databaseParam, apikey=autToken,endpoint= TdConnectionEndPoint) 
+
+class BranchInformation:
+        mews_client_token:str
+        mews_client_name:str
+        mews_access_token:str
+        internal_property_code:str
+        subscription:str
+        brand:str
+        city:str
+        country:str
+
+        def __init__(self,brahchItemValues):
+            self.mews_client_token =brahchItemValues[0]
+            self.mews_client_name =brahchItemValues[1]
+            self.mews_access_token =brahchItemValues[2]
+            self.internal_property_code =brahchItemValues[3]
+            self.subscription =brahchItemValues[4]
+            self.brand =brahchItemValues[5]
+            self.city =brahchItemValues[6]
+            self.country=brahchItemValues[7]
+
+#****************************************************/
+
+class Utils:
+    
+    @staticmethod
+    def getGlobalTdClientConnection():
+       return tdClientConnection
+   
+    @staticmethod
+    def create_request_post(url,payload,headers):
+        req = requests.Request('POST',  url, data=payload, headers=headers)
+        prepped = session.prepare_request(req)
+        response = session.send(prepped)
+   
+        return response
+
+    @staticmethod
+    def  get_date_range_given_year( year:int):
+        
+        iso_datetime_format = '%Y-%m-%dT%H:%M:%SZ'
+        date_time_str = f'01/01/{year} 00:00:00'
+        dateList = []
+        startDate = datetime.strptime(date_time_str, '%d/%m/%Y %H:%M:%S')
+        endDate  = None
+        processYear =0
+
+        while(processYear <= year ):
+            startDate =   startDate if endDate is None else endDate 
+            endDate = (startDate + timedelta(days=5) )  #- timedelta(seconds=1)
+            dateList.append((startDate.strftime(iso_datetime_format) ,endDate.strftime(iso_datetime_format)))
+            processYear = endDate.year
+              
+        return dateList
+
+    @staticmethod
+    def deallocateObjectInMemory(obj:Dict, callGc=False):
+        obj.clear()
+        del obj[:]
+        del obj
+        if(callGc):
+            gc.collect()
+
+    @staticmethod
+    def setLogFilePath(file_suffix=None):
+        date =str(datetime.today().date())
+        fileName= f'mews_to_td_{file_suffix}_{date}.log'
+        logFilePath =    'logs/' + fileName
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s, %(levelname)s, %(message)s',  filename=logFilePath, filemode='a')
+    
+    @staticmethod
+    def getRoot_dir():
+        return  os.path.dirname(os.path.abspath(__file__))
+    
+    @staticmethod
+    def get_AllBranchesListTD(): 
+        branchesList =[]
+        branches = Utils.getGlobalTdClientConnection().query("select mews_client_token,mews_client_name,mews_access_token, internal_property_code , subscription, brand, city,country from all_branches_map order by subscription")
+        for branch in branches["data"]:
+            newBranch =BranchInformation(branch)
+            branchesList.append(newBranch)
+        return branchesList
+
+    @staticmethod
+    # identifly gender using 
+    def genderIdentificationByName(): 
+        logging.info("started genderIdentiflyWifiAndCommunity")
+        __gd = GenderDetector()
+    
+        def nameToGender(fullName):
+            try:
+                return  'Male' if(__gd.get_gender(fullName).gender =='m') else  'Female' 
+            except:
+                return None
+
+        NamesGenderList = []
+        namesList = Utils.getGlobalTdClientConnection().query(
+            """ 
+                SELECT 
+                    DISTINCT  trim((firstname_clean )) || ' t' as name_with_generic_surname,  
+                    trim((firstname_clean)) as name_clean 
+                FROM db_raw.combine_all_customer_sources_enriched t  
+                where LENGTH(firstname_clean) <20
+            """
+            )
+       
+        for name in namesList["data"]:
+           name_with_generic_surname = name[0]
+           name_clean = name[1]
+           gender_inferred = nameToGender(name_with_generic_surname)
+           if (gender_inferred): 
+                dicItem:dict={}
+                dicItem["name_lowercase"] =  name_clean
+                dicItem["Gender"] = gender_inferred
+                NamesGenderList.append(dicItem)
+
+        json_data = json.dumps(NamesGenderList)
+        dataframe  = pd.read_json(json_data)
+
+        Utils.getGlobalTdClientConnection().load_table_from_dataframe(
+            dataframe=dataframe, 
+            destination= 'db_lookups.name_gender', 
+            writer ='bulk_import',
+            if_exists='overwrite'
+            )
+
+    @staticmethod
+    def load_data(branchFolderCode,fn):
+        root_dir = Utils.getRoot_dir()
+
+        if( branchFolderCode is not None ):
+            rootDirBranchFolder =  os.path.join(root_dir, branchFolderCode)
+        else:
+            rootDirBranchFolder = root_dir
+
+        rootDirBranchFolderFileName = os.path.join(rootDirBranchFolder, fn)
+        data = {}
+        try:
+            with open(rootDirBranchFolderFileName) as f:
+                data = json.load(f)
+        except Exception as e:
+            logging.exception(e)
+
+        return data
+  
+    @staticmethod
+    def makeFullPathOfFile(branchFolderCode, fn):
+        root_dir = Utils.getRoot_dir()
+        rootDirBranchFolder = os.path.join(root_dir, branchFolderCode)
+        #Utils.createBranchFolder(branchFolderCode)
+        rootDirBranchFolderFileName = os.path.join(rootDirBranchFolder, fn)
+
+        return rootDirBranchFolderFileName 
+    
+    @staticmethod
+    def save_dataToCsv(data, branchFolderCode, fn):
+        if any([not data, not fn]):
+            return
+        
+        logging.log(f"Exporting {fn} as csv ")
+        rootDirBranchFolderFileName = Utils.makeFullPathOfFile(branchFolderCode=branchFolderCode, fn=fn)
+        with open(rootDirBranchFolderFileName, 'w') as f:
+            json.dump({'data': data, 'ts': time.time()}, f)
+
+#****************************************************/
+ 
+class SynchProcess:
+    
+    @staticmethod
+    def startInitialFullDataTransfer():
+        allbranchList = Utils.get_AllBranchesListTD()
+
+        # for common share data
+        branchItemSample = allbranchList[0]
+        branchProcesInstance:BranchProcess = BranchProcess(branchItemSample)
+        
+        branchProcesInstance.initFullDataTransferForCommonShareBranchesData()
+         
+        # for branch based  data
+        for branchItem in allbranchList:
+            branchProcesInstance:BranchProcess = BranchProcess(branchItem)
+            branchProcesInstance.initFullDataTransferForBranchBasedData()
+
+    @staticmethod
+    def startInitialIncrementalDataTransfer():
+        allbranchList = Utils.get_AllBranchesListTD()
+         # for common share data
+        branchItemSample = allbranchList[0]
+        branchProcesInstance:BranchProcess = BranchProcess(branchItemSample)
+        branchProcesInstance.initIncrementalDataTransferForCommonShareBranchesData();
+
+        # for branch based  data
+        for branchItem in allbranchList:
+                branchProcesInstance:BranchProcess = BranchProcess(branchItem)
+                branchProcesInstance.initIncrementalDataTransferForBranchBasedData()
+
+#****************************************************/
+
+class MewsAPI:
+    
+    BranchInfoItem:BranchInformation
+    mewsApiUrl = f'https://api.mews.com/api/connector/v1/'
+    headers = {
+            'Content-Type': 'application/json',
+        }
+    service_ids = []
+
+    def __init__(self, BranchInfoItem:BranchInformation):
+           self.BranchInfoItem = BranchInfoItem
+           self.service_ids = self.get_service_ids()
+
+    def httpPost(self, endpoint, dataHttp,headers, raiseErrorIfFailed=False):
+         #retry mechanizm v2 manually 
+        httpResponse =None
+        for x in range(1,5):
+            try :
+
+                httpResponse =  Utils.create_request_post(url=endpoint, payload=dataHttp, headers=headers)
+                #httpResponse = requests.post(url=endpoint, data=dataHttp, headers=headers, timeout=60)
+                if httpResponse.status_code == 200:
+                    break
+                else:
+                  time.sleep(3)
+            except Exception as ex : 
+                time.sleep(3)
+                logging.debug(ex)
+            #finally:
+                #if httpResponse is not None:
+                    #httpResponse.close()
+        
+        
+        if raiseErrorIfFailed and httpResponse.status_code != 200 :
+           raise  Exception(f"Custome Exception: Failed to retrieve data from MEWS API, got response {httpResponse.status_code} messagge: {httpResponse.text} ")
+        elif (not raiseErrorIfFailed and httpResponse.status_code != 200):
+            logging.error(f"Custome Exception: Failed to retrieve data from MEWS API, got response {httpResponse.status_code}")
+    
+        return httpResponse.json()
+        
+    def getBaseHttpDataHeaderForBranch(self,additional_params=None):
+        dataHttp = {
+            'ClientToken': self.BranchInfoItem.mews_client_token,
+            'AccessToken': self.BranchInfoItem.mews_access_token ,
+            "Client": self.BranchInfoItem.mews_client_name ,
+        }
+        
+        if(additional_params):
+            dataHttp.update(additional_params)
+          
+        return json.dumps(dataHttp)
+
+    def get_FullEndPointURL(self,mews_entity_name):
+        return  self.mewsApiUrl + f'{mews_entity_name}/getAll'
+
+    #@backoff.on_exception(backoff.expo, requests.exceptions.RequestException, backoff_log_level=logging.WARNING)
+    def get_Request(self, mews_entity_name, filter_type, start_date=None, end_date=None, datetime_date_range=None):
+       
+        result = []
+        endpoint =  self.get_FullEndPointURL(mews_entity_name=mews_entity_name)
+        
+        if filter_type == 'rates':
+            additional_params = {
+                'ServiceIds':self.service_ids
+            }
+        #time filter of the interval. If not specified, reservations Colliding with the interval are returned.
+        if filter_type == 'reservations_full_created':
+            additional_params = {
+                'TimeFilter': 'Created',
+                'StartUtc':  start_date,
+                'EndUtc':    end_date,
+                'ServiceIds': self.service_ids,
+                'States': ['Started','Confirmed','Processed','Canceled','Optional','Requested','Enquired']
+            } 
+        else:
+            additional_params = {
+                f'{filter_type}': {
+                    'StartUtc': start_date,
+                    'EndUtc': end_date
+                }
+            }
+
+        if datetime_date_range:
+            if filter_type == 'reservations_updated':
+                additional_params = {
+                    'TimeFilter': 'Updated',
+                    'StartUtc': datetime_date_range[0],
+                    'EndUtc': datetime_date_range[1],
+                    'ServiceIds': self.service_ids,
+                    'States': ['Started','Confirmed','Processed','Canceled','Optional','Requested','Enquired']
+                }
+            elif filter_type == 'reservations_created':
+                additional_params = {
+                    'TimeFilter': 'Created',
+                    'StartUtc': datetime_date_range[0],
+                    'EndUtc': datetime_date_range[1],
+                    'ServiceIds': self.service_ids,
+                    'States': ['Started','Confirmed','Processed','Canceled','Optional','Requested','Enquired']
+                }
+            elif filter_type == 'ClosedUtc':
+                additional_params = {} 
+                additional_params['ClosedUtc'] = dict(zip(('StartUtc', 'EndUtc'), datetime_date_range))
+            elif filter_type == 'ConsumedUtc':
+                additional_params = {}
+                additional_params['ConsumedUtc'] = dict(zip(('StartUtc', 'EndUtc'), datetime_date_range))
+            elif mews_entity_name == 'Bills':
+                additional_params['CreatedUtc'] = dict(zip(('StartUtc', 'EndUtc'), datetime_date_range))
+            else:
+                additional_params = {}
+                additional_params['UpdatedUtc'] = dict(zip(('StartUtc', 'EndUtc'), datetime_date_range))
+        
+        branchHttpDataHeader = self.getBaseHttpDataHeaderForBranch(additional_params=additional_params)
+        
+        logOutput = f'Get Data,branch={self.BranchInfoItem.internal_property_code},entity_name={mews_entity_name},startDate={start_date}, endDate={end_date} ,filter_type={filter_type},datetime_range={datetime_date_range}'
+        print(logOutput)
+        logging.info(logOutput)
+
+        httpResponse = self.httpPost(endpoint=endpoint,dataHttp=branchHttpDataHeader,headers=self.headers)
+        dataResponse = httpResponse if httpResponse else {} 
+        result =dataResponse.get(mews_entity_name, [])
+        
+        return result
+
+    def get_service_ids(self):
+            service_ids_list =[]
+            endpoint =  self.get_FullEndPointURL(mews_entity_name='services')
+            
+            branchHttpDataHeader = self.getBaseHttpDataHeaderForBranch()
+            httpResponse = self.httpPost(endpoint=endpoint,dataHttp=branchHttpDataHeader,headers=self.headers)
+        
+            services = httpResponse['Services']
+            bookable_services = list(filter(lambda x: x['Data']['Discriminator'] == 'Bookable' and x['IsActive'] == True, services))
+            for service in bookable_services:
+                service_ids_list.append(service['Id'])
+                
+            return service_ids_list
+            
+             
+#***************************************************+
+
+class TreasureDataAPI:
+    
+    BranchInfoItem:BranchInformation = None 
+    __gd = GenderDetector()
+    countryListMapping = {}
+    
+    re_valid_email = re.compile(
+            """(?:[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9]))\.){3}(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9])|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])"""
+        )  # sourced from https://stackoverflow.com/questions/201323/how-to-validate-an-email-address-using-a-regular-expression
+   
+    re_valid_phone = re.compile('^\+?[0-9]\d{1,15}$')
+
+    def __init__(self, BranchInfoItem:BranchInformation):
+       self.BranchInfoItem =BranchInfoItem
+       clist = pycountry.countries
+       
+       # fill country name and apha_2 lookup..
+       self.countryListMapping["Laos"] ='LA'
+       for c in clist:
+            self.countryListMapping[c.name] = str(c.alpha_2).upper()
+
+    def writeDataFrameToTD(self,dataFrame:pd.DataFrame,targetLoadTable:str):
+            #bulkWriterMode=  True if (dataFrame[dataFrame.columns[0]].count() > 200 ) else False
+            
+            Utils.getGlobalTdClientConnection().load_table_from_dataframe(
+            dataframe=dataFrame, 
+            destination=  targetLoadTable.lower(),
+            #writer= ('bulk_import' if(bulkWriterMode)  else  'insert_into' ),
+            writer ='bulk_import',
+            if_exists='append'
+            )
+ 
+    def checkTableIsExists(self,mews_entity_name:str ):
+         query = f"select 1 from information_schema.tables where table_schema='{databaseParam}' and table_name ='{mews_entity_name.lower()}'"
+         result = Utils.getGlobalTdClientConnection().query(query)
+         return len(result["data"]) > 0 
+
+    def deleteDataByBranchId(self, mews_entity_name:str):    
+         tableResult = self.checkTableIsExists(mews_entity_name)
+         
+         if(tableResult):        
+             query = f"DELETE FROM {mews_entity_name.lower()} WHERE internal_property_code='{self.BranchInfoItem.internal_property_code}'"
+             result = Utils.getGlobalTdClientConnection().query(query)
+             logging.info("{0} records has been deleted".format(result["data"][0]))
+        
+    def save(self, data, mews_entity_name ):
+        if (len(data)>0):
+            print("transformation steps...")
+            dataFrame = self.transformDictToDataFrame(data=data)
+            dataframeTransformed = self.transformData(dataframe=dataFrame,transformation_method_name=mews_entity_name)
+            
+            print("writing steps...")
+            self.writeDataFrameToTD(dataFrame=dataframeTransformed, targetLoadTable=mews_entity_name)
+
+    def transformData(self, dataframe:pd.DataFrame, transformation_method_name:str):
+        # transformation consist of two phases, first phase is custom transformation , for each individual entities,
+        # another one is general transformation to apply into all entity.
+        # first, individual entity  transformation applies
+        
+        logging.info("transform operation started")
+        methodName = f'transform_{transformation_method_name}'
+        transform_obj = getattr(self, methodName)
+        dataframeTransformed =transform_obj(dataframe) 
+        
+        # then generic transformation applies for entity
+        dataframeTransformed =self.generalTransformForAllEntities(dataframeTransformed)
+
+        return dataframeTransformed
+
+    def generalTransformForAllEntities(self, dataframe:pd.DataFrame):
+        # set property branch code 
+        dataframe["internal_property_code"] = self.BranchInfoItem.internal_property_code
+        dataframe["td_insert_timestamp"] = datetime.now()
+
+        #clear all utc datetime values, remove T value in order to make easy transformation in prestoDb
+        columnsNameList = dataframe.columns.to_list()
+        for columnName in columnsNameList:
+            if('Utc' in columnName):          
+                 dataframe[columnName] = dataframe[columnName].apply(lambda val:  val.replace('T',' ') if (val) else None)
+        return dataframe
+
+    def transform_Customers(self,dataframe:pd.DataFrame):
+         
+          dataframe['email_clean'] = dataframe['Email'].apply(lambda email: '' if '@guest' in str(email) else email)
+          dataframe['FirstName_clean'] = dataframe["FirstName"].apply(self.cleanText)
+          dataframe['LastName_clean'] = dataframe["LastName"].apply(self.cleanText)
+          dataframe['full_name_clean'] = dataframe.apply(self.fullnameGenerate , axis=1)
+                    
+          dataframe['email_domain'] = dataframe["Email"].apply(lambda email: email.lower().split('@')[1] if '@' in str(email) else '')
+          
+          dataframe['phone_raw'] = dataframe["Phone"].apply(lambda phone: '"' +   str(phone) + '"' if phone is not None else None )
+
+          dataframe['phone_clean'] = dataframe["Phone"].apply(self.phoneClean)
+          
+          dataframe['phone_clean'] = dataframe.apply( self.clean_phone_number , axis=1)
+          # call re-clean
+          dataframe['phone_clean'] = dataframe["phone_clean"].apply(self.phoneClean)
+
+          dataframe['phone_inferred_country_full_name'] = dataframe["phone_clean"].apply(self.phone_to_country)
+          dataframe['phone_inferred_country_alpha2'] = dataframe["phone_inferred_country_full_name"].apply(self.countryFullName2Alpha2)
+          dataframe = dataframe.drop(columns=['phone_inferred_country_full_name'])
+     
+          dataframe['Email'] = dataframe["Email"].apply(lambda email: str.lower(email).strip().strip('.').strip(';').strip('*').strip('#') if email is not None else None )
+
+          dataframe['mail_domain_country'] = dataframe.Email.apply(lambda email:  str.lower(email[-3:]) if email is not None else None )
+          dataframe['email_clean'] = dataframe["email_clean"].apply(self.cleanText) 
+          dataframe['phone_valid'] = ~dataframe["phone_clean"].isin(['.', 'nan']) & dataframe["phone_clean"].apply(lambda phone: self.re_valid_phone.match(str(phone)) is not None)
+          dataframe['phone_is_mobile'] = dataframe["phone_clean"].apply(self.phone_is_mobile)
+          
+          dataframe['email_valid'] = dataframe["email_clean"].apply(lambda email: self.re_valid_email.match(str(email)) is not None)
+          dataframe['email_tld'] = dataframe['email_clean'].apply(lambda email: str(email).split('.')[-1].lower())
+
+          dataframe['blacklist'] = dataframe["Classifications"].apply(lambda value: 1 if 'Blacklist' in str(value) else 0 )
+          dataframe['send_marketing_emails'] = dataframe["Options"].apply(lambda value: 1 if 'SendMarketingEmails' in str(value) else 0)
+                   
+          return dataframe 
+        
+    def transform_Companies(self,dataframe:pd.DataFrame):
+         return dataframe
+
+    def transform_AccountingItems(self,dataframe:pd.DataFrame):
+        return dataframe
+        
+    def transform_Reservations(self,dataframe:pd.DataFrame):
+        return dataframe
+
+    def transform_Bills(self,dataframe:pd.DataFrame):  
+        return dataframe
+
+    def transform_Rates(self,dataframe:pd.DataFrame):
+        return dataframe
+
+    def transformDictToDataFrame(self, data:list, makeDataNormalize=False) -> pd.DataFrame :
+        dataFrame:pd.DataFrame = pd.DataFrame()
+        if (len(data)>0):
+            dataFrame =  pd.json_normalize(data, max_level=1, sep="_", errors="ignore") if (makeDataNormalize) else  pd.DataFrame(data)
+        return dataFrame
+
+    def saveDatabyRowAPI(self, data, table_name):
+        
+        def writeDataApi(data, table_name):
+            url =  writeApiUrl + f'/{table_name}'
+            json_data = json.dumps(data)
+            headers = {
+                 'Content-Type': 'application/json',
+                 'X-TD-Write-Key': self.BranchInfoItem.mews_access_token,
+                 }
+            
+            resp = requests.post(url=url, data=json_data.encode(), headers=headers)
+            return resp.json()
+
+        for record in data:
+            resp = writeDataApi(record, table_name)
+    
+    def countryFullName2Alpha2(self, value):
+         try:
+            result = None
+            if value in self.countryListMapping:
+                result = self.countryListMapping[value]
+
+            if result is None and value not in ('None','', numpy.nan):
+                countryDetails = pycountry.countries.search_fuzzy(value)
+                if countryDetails is not None:
+                    result = countryDetails[0].alpha_2
+         except:
+             pass 
+    
+         return result
+    
+    def phone_is_mobile(self, number):
+        try:
+            return carrier._is_mobile(phonenumbers.phonenumberutil.number_type(phonenumbers.parse(number)))
+        except:
+            return False
+     
+    def phone_to_country(self, number):
+        try:
+            return geocoder.country_name_for_number(phonenumbers.parse(number), "en")
+        except:
+            pass
+
+    def clean_phone_number(self, row):
+
+        tel_in = str(row['Phone'])
+        try:
+            country = str(row['NationalityCode'])
+        except TypeError:
+            return '' 
+        try:
+            result = phonenumbers.format_number(phonenumbers.parse(tel_in, region=country, _check_region=True),
+                                            phonenumbers.PhoneNumberFormat.E164)
+            return result
+        except phonenumbers.NumberParseException:
+            return re.sub('\s', '', tel_in.strip().lower())
+
+    def cleanText(self, text): 
+        if (text is not None ):
+            value = str(text).strip().lower() 
+            if (   'tbc'  in value  or len(value)<2 ):
+                return None
+            
+            else : 
+                return value
+        return None
+    
+    def phoneClean(self, text): 
+        if (text is None ):
+            return None
+        
+        value = str(text).strip().lower() 
+        if (len(value)<2 ):
+            return None
+            
+        value = value.replace('+','').replace('(','').replace(')','').replace('/','').replace('-','').replace('.','')
+
+        if (len(value)<2 ):
+            return None
+
+        return value
+        
+    def fullnameGenerate(self, row):
+        name =  row['FirstName_clean']
+        surname= row['LastName_clean'] 
+        
+        if ( name is not None and surname is not None ):
+            return ' '.join([name, surname ])
+        elif (surname is not None):
+            return surname
+        elif(name is not None):
+            return name
+        else : 
+            return None
+      
+#***************************************************#
+
+class BranchProcess:
+
+    trdata_api:TreasureDataAPI = None
+    mews_api:MewsAPI = None
+    BranchInfoItem:BranchInformation = None 
+    datetime_date_range = None
+    
+    # global settings parameters  
+    startYearForInitialLoad = 2019
+    endYearForInitialLoad = 2025
+    inchMinutesBehindSynch = 60*24 # check any updated or created for objects for 24 hours 
+
+    def __init__(self,BranchInfoItem:BranchInformation):
+        self.BranchInfoItem = BranchInfoItem
+        
+        self.datetime_date_range = self.create_utcdatetime_range(minutes=inchMinutesBehindSynch)
+        self.trdata_api = TreasureDataAPI(BranchInfoItem)
+        self.mews_api = MewsAPI( BranchInfoItem )
+
+    def create_utcdatetime_range(self,minutes):
+        iso_fmt = '%Y-%m-%dT%H:%M:%SZ'
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(minutes=minutes) 
+        start_dt_iso = start_dt.strftime(iso_fmt)
+        end_dt_iso = end_dt.strftime(iso_fmt)
+        return (start_dt_iso, end_dt_iso)
+
+    """
+    def update_data_job(self, mews_entity_name:str, filter_type, minutes):
+        print('update ', mews_entity_name)
+        datetime_date_range = self.get_utcdatetime_range(minutes=minutes)
+        mews_data = self.mews_api.get_Request(mews_entity_name=mews_entity_name, filter_type=filter_type, datetime_date_range=datetime_date_range) 
+        
+        # find new data 
+        epocTime  = round( ( datetime.now() - timedelta(days=1) ).timestamp() )
+        query=  f"SELECT id from {mews_entity_name.lower()} where time >= {epocTime} and internal_property_code = '{self.BranchInfoItem.internal_property_code}'"
+        resp = Utils.getGlobalTdClientConnection().query(query)
+        treasure_data_id = [x[0] for x in resp["data"] if x]
+        mews_data_filtered = [x for x in mews_data if x['Id'] not in treasure_data_id]
+
+        if mews_data_filtered:
+            self.trdata_api.save(data=mews_data_filtered,  mews_entity_name=mews_entity_name)
+            #self.trdata_api.saveDatabyRowAPI(mews_data_filtered, table_name)
+        else:
+            print(f'no updates found for {mews_entity_name}')
+    """
+
+    def update_data_job(self, mews_entity_name:str, filter_type ):
+        logging.info('update ' + mews_entity_name)
+        mews_data = self.mews_api.get_Request(mews_entity_name=mews_entity_name, filter_type=filter_type, datetime_date_range= self.datetime_date_range) 
+        
+        self.trdata_api.save(data=mews_data,  mews_entity_name=mews_entity_name)
+        #self.trdata_api.saveDatabyRowAPI(mews_data_filtered, table_name)
+        
+    def recreate_data_job(self,mews_entity_name, filter_type):
+        
+       self.trdata_api.deleteDataByBranchId(mews_entity_name)
+       
+       if mews_entity_name in ('Rates'):
+            result = self.mews_api.get_Request(mews_entity_name=mews_entity_name, filter_type=filter_type, start_date=None, end_date=None) 
+             
+            self.trdata_api.save(data=result, mews_entity_name=mews_entity_name)
+           
+       else:
+            for year in range(self.startYearForInitialLoad,self.endYearForInitialLoad):
+                yearlyResultData = []
+                monnthlyCrunksInYear = Utils.get_date_range_given_year(year=year)
+                for startDate,EndDate in monnthlyCrunksInYear:
+                    crunk = self.mews_api.get_Request(mews_entity_name=mews_entity_name, filter_type=filter_type, start_date=startDate, end_date=EndDate) 
+                    yearlyResultData += crunk
+                    #Utils.deallocateObjectInMemory(crunk)
+                
+                self.trdata_api.save(data=yearlyResultData, mews_entity_name=mews_entity_name)
+                #Utils.deallocateObjectInMemory(yearlyResultData, callGc=True)
+           
+    def initFullDataTransferForCommonShareBranchesData(self):
+        self.recreate_data_job(mews_entity_name='Customers', filter_type='CreatedUtc')
+        self.recreate_data_job(mews_entity_name='Companies', filter_type='CreatedUtc')
+
+    def initFullDataTransferForBranchBasedData(self):
+        self.recreate_data_job(mews_entity_name='Rates', filter_type='rates')
+        self.recreate_data_job(mews_entity_name='Reservations',  filter_type='reservations_full_created')
+        self.recreate_data_job(mews_entity_name='AccountingItems', filter_type='ConsumedUtc')
+        self.recreate_data_job(mews_entity_name='Bills',  filter_type='CreatedUtc')
+
+    def initIncrementalDataTransferForCommonShareBranchesData(self):
+        self.update_data_job(mews_entity_name='Customers',  filter_type='CreatedUtc')
+        self.update_data_job(mews_entity_name='Customers',  filter_type='UpdatedUtc')
+        self.update_data_job(mews_entity_name='Companies', filter_type='CreatedUtc' )
+        self.update_data_job(mews_entity_name='Companies', filter_type='UpdatedUtc' )
+        
+    def initIncrementalDataTransferForBranchBasedData(self):
+        self.recreate_data_job(mews_entity_name='Rates', filter_type='rates')
+        self.update_data_job(mews_entity_name='Reservations', filter_type='reservations_updated')
+        self.update_data_job(mews_entity_name='Reservations', filter_type='reservations_created')
+        self.update_data_job(mews_entity_name='AccountingItems', filter_type='ConsumedUtc')
+        self.update_data_job(mews_entity_name='AccountingItems', filter_type='ClosedUtc')
+        self.update_data_job(mews_entity_name='Bills', filter_type='CreatedUtc')
+        self.update_data_job(mews_entity_name='Bills', filter_type='ClosedUtc')
+
+
+if __name__ == "__main__":
+    
+    try: 
+
+        args = sys.argv[1:]
+        runningTypeParm = None
+        inchMinutesBehindSynch = 60*24 # check any updated or created for objects for 24 hours 
+       
+        if(len(args)>0):
+            runningTypeParm =str.lower(args[0])
+        
+        #runningTypeParm='full'
+        Utils.setLogFilePath(file_suffix=runningTypeParm)
+
+        #Utils.genderIdentificationByName()
+        
+        if(runningTypeParm is None or runningTypeParm =='inch'):
+            print("incremental update has been started")
+            #inchMinutesBehindSynch = 60*24 # check any updated or created for objects for 24 hours 
+            SynchProcess.startInitialIncrementalDataTransfer()
+        elif(runningTypeParm =='full'):
+            print("full update has been started")
+            SynchProcess.startInitialFullDataTransfer()
+            
+        logging.info("successfully finished update")
+    except Exception as ex:
+         print(ex)
+         logging.exception(ex)
